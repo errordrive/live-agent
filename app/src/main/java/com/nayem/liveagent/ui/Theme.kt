@@ -1,5 +1,7 @@
 package com.nayem.liveagent.ui
 
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -8,13 +10,19 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.nayem.liveagent.R
 
 // Warm ivory light / charcoal dark, bronze accent, sage secondary.
 private val Ivory = Color(0xFFFAF7F2)
@@ -70,7 +78,33 @@ private val DarkColors = darkColorScheme(
     error = Color(0xFFE8A58C)
 )
 
-val HeadingFont = FontFamily.Serif
+/** Inter — the app's only font (400/500/600/700), bundled as resources. */
+val InterFont = FontFamily(
+    Font(R.font.inter_regular, FontWeight.Normal),
+    Font(R.font.inter_medium, FontWeight.Medium),
+    Font(R.font.inter_semibold, FontWeight.SemiBold),
+    Font(R.font.inter_bold, FontWeight.Bold)
+)
+
+/** Headings and body both use Inter now (v1.0 used a serif for headings). */
+val HeadingFont: FontFamily = InterFont
+val BodyFont: FontFamily = InterFont
+
+private val AppTypography = Typography(
+    displayLarge = TextStyle(fontFamily = InterFont, fontWeight = FontWeight.Bold, fontSize = 30.sp, lineHeight = 36.sp),
+    headlineMedium = TextStyle(fontFamily = InterFont, fontWeight = FontWeight.Bold, fontSize = 24.sp, lineHeight = 30.sp),
+    titleLarge = TextStyle(fontFamily = InterFont, fontWeight = FontWeight.SemiBold, fontSize = 20.sp, lineHeight = 26.sp),
+    titleMedium = TextStyle(fontFamily = InterFont, fontWeight = FontWeight.SemiBold, fontSize = 17.sp, lineHeight = 22.sp),
+    bodyLarge = TextStyle(fontFamily = InterFont, fontWeight = FontWeight.Normal, fontSize = 16.sp, lineHeight = 24.sp),
+    bodyMedium = TextStyle(fontFamily = InterFont, fontWeight = FontWeight.Normal, fontSize = 15.sp, lineHeight = 22.sp),
+    labelLarge = TextStyle(fontFamily = InterFont, fontWeight = FontWeight.Medium, fontSize = 14.sp, lineHeight = 20.sp)
+)
+
+/** Smooth spring used by all animated components (no techy snap, no jank). */
+fun <T> smoothSpring() = spring<T>(
+    dampingRatio = Spring.DampingRatioMediumBouncy,
+    stiffness = Spring.StiffnessMediumLow
+)
 
 @Composable
 fun LiveAgentTheme(
@@ -79,6 +113,7 @@ fun LiveAgentTheme(
 ) {
     MaterialTheme(
         colorScheme = if (darkTheme) DarkColors else LightColors,
+        typography = AppTypography,
         content = content
     )
 }
