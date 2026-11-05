@@ -160,7 +160,88 @@ class LiveAccessibilityService : AccessibilityService() {
 
     fun pressHome(): Boolean = performGlobalAction(GLOBAL_ACTION_HOME)
 
+    fun pressRecents(): Boolean = performGlobalAction(GLOBAL_ACTION_RECENTS)
+
     fun lockScreen(): Boolean = performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN)
+
+    fun volumeUp(): Boolean {
+        val audio = getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+            ?: return false
+        return try {
+            audio.adjustVolume(android.media.AudioManager.ADJUST_RAISE, android.media.AudioManager.FLAG_SHOW_UI)
+            true
+        } catch (_: Exception) { false }
+    }
+
+    fun volumeDown(): Boolean {
+        val audio = getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+            ?: return false
+        return try {
+            audio.adjustVolume(android.media.AudioManager.ADJUST_LOWER, android.media.AudioManager.FLAG_SHOW_UI)
+            true
+        } catch (_: Exception) { false }
+    }
+
+    /** Long-press at coordinates (500 ms hold). */
+    fun longPressAt(x: Float, y: Float): Boolean {
+        val path = Path().apply { moveTo(x, y); lineTo(x + 1f, y) }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0, 500))
+            .build()
+        return dispatchGesture(gesture, null, null)
+    }
+
+    /** Swipe from (x1,y1) to (x2,y2) over ~300 ms. */
+    fun swipe(x1: Float, y1: Float, x2: Float, y2: Float): Boolean {
+        val path = Path().apply { moveTo(x1, y1); lineTo(x2, y2) }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0, 300))
+            .build()
+        return dispatchGesture(gesture, null, null)
+    }
+
+    /** Tap the node whose view resource id matches (e.g. "com.app:id/button"). */
+    fun tapById(viewId: String): Boolean {
+        val root = rootInActiveWindow ?: return false
+        val nodes = root.findAccessibilityNodeInfosByViewId(viewId)
+        for (node in nodes) {
+            var current: AccessibilityNodeInfo? = node
+            while (current != null) {
+                if (current.isClickable) return current.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                current = current.parent
+            }
+        }
+        return false
+    }
+
+    /** Long-press the first node matching the given text. */
+    fun longPressText(text: String): Boolean {
+        val node = findNodeByText(text) ?: return false
+        var current: AccessibilityNodeInfo? = node
+        while (current != null) {
+            if (current.isLongClickable) {
+                return current.performAction(AccessibilityNodeInfo.ACTION_LONG_CLICK)
+            }
+            current = current.parent
+        }
+        // Fallback: gesture long-press at the node's center.
+        val bounds = Rect()
+        node.getBoundsInScreen(bounds)
+        return if (!bounds.isEmpty) longPressAt(bounds.centerX().toFloat(), bounds.centerY().toFloat()) else false
+    }
+
+    /** Select all text in the currently focused editable field. */
+    fun selectAllText(): Boolean {
+        val root = rootInActiveWindow ?: return false
+        val target = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+            ?: findEditableNode(root) ?: return false
+        val length = target.text?.length ?: 0
+        val args = Bundle().apply {
+            putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, 0)
+            putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, length)
+        }
+        return target.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, args)
+    }
 
     fun dumpScreenText(): String {
         val root = rootInActiveWindow ?: return ""
