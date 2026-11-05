@@ -107,17 +107,20 @@ class AgentOrchestrator(
         }
     }
 
-    /** Planner-model fallback: ask Gemini to split the goal into short steps. */
+    /** Planner-model fallback: ask Gemini to split the goal into short steps.
+     *  Memory is read first so remembered preferences shape the plan. */
     private suspend fun plannerPlan(goal: String): TaskPlan {
         if (!secure.hasGeminiKey()) {
             return TaskPlan(goal, listOf(
-                PlanStep("Answer by voice (no API key set yet — add one in the Live tab)", "speak",
+                PlanStep("Answer by voice (no API key set yet — add one in Settings)", "speak",
                     mapOf("prompt" to goal))
             ))
         }
         return try {
             val settings = stores.loadSettings()
+            val memory = com.nayem.liveagent.data.MemoryAuto.memoryContext(stores)
             val prompt = "${settings.systemPrompt}\n\n${AppSettings.HARD_RULES}\n\n" +
+                (if (memory.isNotBlank()) "$memory\n\n" else "") +
                 "Split this goal into at most 6 short steps, one per line, each starting with one of: " +
                 "OPEN_APP, YOUTUBE, CHROME, NOTE, TERMINAL, TIMER, SPEAK. Goal: $goal"
             val text = GeminiRestClient(secure.geminiApiKey).generateText(prompt, settings.plannerModel)
@@ -181,12 +184,31 @@ class AgentOrchestrator(
             "intent_note" -> phoneTools.openNoteApp(stores.loadSettings().noteAppPackage, "Note", args["text"] ?: "")
             "intent_app" -> phoneTools.openAppByName(args["name"] ?: args["text"] ?: "")
             "a11y_tap" -> {
-                val svc = LiveAccessibilityService.instance
-                    ?: return ToolResult(false, "Accessibility service is not enabled — enable it in Settings")
-                val text = args["text"] ?: args["query"] ?: ""
-                if (svc.tapText(text)) ToolResult(true, "Tapped \"$text\"")
-                else ToolResult(false, "Could not find \"$text\" on screen")
+                phoneTools.screenTapText(args["text"] ?: args["query"] ?: "")
             }
+            "screen_tap" -> phoneTools.screenTapText(args["text"] ?: args["query"] ?: "")
+            "screen_tap_at" -> {
+                val x = args["x"]?.toFloatOrNull() ?: 0f
+                val y = args["y"]?.toFloatOrNull() ?: 0f
+                phoneTools.screenTapAt(x, y)
+            }
+            "screen_tap_id" -> phoneTools.screenTapById(args["viewId"] ?: args["text"] ?: "")
+            "screen_longpress" -> phoneTools.screenLongPressText(args["text"] ?: "")
+            "screen_swipe" -> {
+                val parts = (args["coords"] ?: "").split(",").mapNotNull { it.trim().toFloatOrNull() }
+                if (parts.size >= 4) phoneTools.screenSwipe(parts[0], parts[1], parts[2], parts[3])
+                else ToolResult(false, "Swipe needs x1,y1,x2,y2 coordinates")
+            }
+            "screen_scroll" -> phoneTools.screenScroll(args["direction"] ?: "down")
+            "screen_press" -> phoneTools.screenPress(args["action"] ?: args["text"] ?: "back")
+            "screen_volume" -> phoneTools.screenVolume(args["direction"] ?: "up")
+            "mcp_call" -> runMcpCall(args)
+            "terminal_ubuntu" -> ToolResult(
+                false,
+                "Ubuntu environment is not available in Live Agent v1.1.0 — " +
+                    "the Ubuntu install was not delivered. Use Termux (terminal_termux) " +
+                    "or the built-in terminal (terminal_builtin) instead."
+            )
             "a11y_type" -> {
                 val svc = LiveAccessibilityService.instance
                     ?: return ToolResult(false, "Accessibility service is not enabled — enable it in Settings")
@@ -226,6 +248,26 @@ class AgentOrchestrator(
                 ToolResult(answer.isNotBlank(), answer.ifBlank { "No answer returned" })
             }
             else -> ToolResult(false, "Unknown tool: ${step.tool}")
+        }
+    }
+
+    /** Call a tool on a configured MCP server. Args: serverId, tool, arguments (JSON). */
+    private suspend fun runMcpCall(args: Map<String, String>): ToolResult {
+        return try {
+            val store = com.nayem.liveagent.mcp.McpStore(context)
+            val serverId = args["serverId"] ?: args["server"] ?: ""
+            val server = store.loadServers().firstOrNull { it.id == serverId && it.enabled }
+                ?: store.loadServers().firstOrNull { it.enabled }
+                ?: return ToolResult(false, "No MCP server configured — add one in the MCP screen first")
+            val tool = args["tool"] ?: return ToolResult(false, "MCP call needs a tool name")
+            val result = com.nayem.liveagent.mcp.McpClient()
+                .callTool(server, tool, args["arguments"] ?: "{}")
+            result.fold(
+                onSuccess = { ToolResult(it.success, it.text.ifBlank { it.error }) },
+                onFailure = { ToolResult(false, "MCP call failed: ${it.message}") }
+            )
+        } catch (e: Exception) {
+            ToolResult(false, "MCP call failed: ${e.message}")
         }
     }
 
