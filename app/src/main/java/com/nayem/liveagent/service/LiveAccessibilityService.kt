@@ -2,6 +2,7 @@ package com.nayem.liveagent.service
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.annotation.SuppressLint
 import android.content.ComponentName
 import android.content.Context
 import android.graphics.Bitmap
@@ -192,6 +193,9 @@ class LiveAccessibilityService : AccessibilityService() {
         }
     }
 
+    // NewApi is suppressed here deliberately: the function returns null on
+    // API < 30 before touching any of these APIs, so the guard is real.
+    @SuppressLint("NewApi")
     fun takeScreenshotToFile(context: Context): File? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
         val latch = CountDownLatch(1)
