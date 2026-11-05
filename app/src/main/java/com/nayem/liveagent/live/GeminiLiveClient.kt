@@ -1,5 +1,7 @@
 package com.nayem.liveagent.live
 
+import android.os.Handler
+import android.os.Looper
 import android.util.Base64
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -26,6 +28,9 @@ sealed interface LiveEvent {
  * Gemini Live API client (official BidiGenerateContent WebSocket).
  * The user's own API key is passed in at runtime; it is never stored here.
  * Handles both text frames and binary frames — the server may send either.
+ *
+ * connect() is standalone: it never calls the REST key test first — a failed
+ * key test must not block a live session, and the socket reports its own errors.
  */
 class GeminiLiveClient(
     private val apiKey: String,
@@ -45,7 +50,13 @@ class GeminiLiveClient(
     private val userPartial = StringBuilder()
     private val agentPartial = StringBuilder()
 
+    /** 20 s guard: setupComplete must arrive after onOpen or the attempt is dead. */
+    private val setupHandler = Handler(Looper.getMainLooper())
+    private var setupTimeoutRunnable: Runnable? = null
+
     fun connect() {
+        // A retry must start clean: drop any stale socket/partials/timer first.
+        reset()
         val url = "wss://generativelanguage.googleapis.com/ws/" +
             "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent" +
             "?key=" + URLEncoder.encode(apiKey, "UTF-8")
@@ -75,6 +86,7 @@ class GeminiLiveClient(
                     })
                 }
                 webSocket.send(setup.toString())
+                startSetupTimeout()
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) = handleMessage(text)
@@ -82,14 +94,26 @@ class GeminiLiveClient(
                 handleMessage(bytes.utf8())
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                cancelSetupTimeout()
                 isConnected = false
-                onEvent(LiveEvent.Error(t.message ?: "Connection failed"))
-                onEvent(LiveEvent.Disconnected(t.message ?: "Connection failed"))
+                socket = null
+                val detail = t.message?.takeIf { it.isNotBlank() }
+                    ?: response?.message?.takeIf { it.isNotBlank() }
+                    ?: "Connection failed"
+                val code = response?.code
+                val message = if (code != null) "WebSocket failed (HTTP $code): $detail"
+                else "WebSocket failed: $detail"
+                onEvent(LiveEvent.Error(message))
+                onEvent(LiveEvent.Disconnected(message))
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                cancelSetupTimeout()
                 isConnected = false
-                onEvent(LiveEvent.Disconnected(reason.ifBlank { "Closed ($code)" }))
+                socket = null
+                val text = if (reason.isNotBlank()) "Closed ($code): $reason"
+                else "Closed ($code)"
+                onEvent(LiveEvent.Disconnected(text))
             }
         })
     }
@@ -124,10 +148,36 @@ class GeminiLiveClient(
         socket.send(msg.toString())
     }
 
+    /** Close cleanly and mark disconnected. Safe to call when already closed. */
     fun disconnect() {
+        cancelSetupTimeout()
         try { socket?.close(1000, "Done") } catch (_: Exception) {}
         socket = null
         isConnected = false
+    }
+
+    /** Full reset so a retry starts clean: disconnect + clear partial transcripts. */
+    fun reset() {
+        disconnect()
+        userPartial.clear()
+        agentPartial.clear()
+    }
+
+    private fun startSetupTimeout() {
+        cancelSetupTimeout()
+        val runnable = Runnable {
+            if (!isConnected) {
+                onEvent(LiveEvent.Error("Timed out waiting for setup — check your key and network"))
+                disconnect()
+            }
+        }
+        setupTimeoutRunnable = runnable
+        setupHandler.postDelayed(runnable, 20_000L)
+    }
+
+    private fun cancelSetupTimeout() {
+        setupTimeoutRunnable?.let { setupHandler.removeCallbacks(it) }
+        setupTimeoutRunnable = null
     }
 
     private fun handleMessage(raw: String) {
@@ -135,10 +185,21 @@ class GeminiLiveClient(
             val json = JSONObject(raw)
             if (json.has("error")) {
                 val err = json.optJSONObject("error")
-                onEvent(LiveEvent.Error(err?.optString("message") ?: "Server error"))
+                val status = err?.optString("status")?.takeIf { it.isNotBlank() }
+                val message = err?.optString("message")?.takeIf { it.isNotBlank() }
+                    ?: "Server error"
+                val detailReason = err?.optJSONArray("details")
+                    ?.optJSONObject(0)?.optString("reason")?.takeIf { it.isNotBlank() }
+                val full = buildString {
+                    if (status != null) append("[$status] ")
+                    append(message)
+                    if (detailReason != null) append(" ($detailReason)")
+                }
+                onEvent(LiveEvent.Error(full))
                 return
             }
             if (json.has("setupComplete")) {
+                cancelSetupTimeout()
                 isConnected = true
                 onEvent(LiveEvent.SetupComplete)
                 onEvent(LiveEvent.Connected(model))
