@@ -1,0 +1,235 @@
+package com.nayem.liveagent.agent
+
+import android.Manifest
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.media.AudioManager
+import android.net.Uri
+import android.os.Build
+import android.telephony.SmsManager
+import android.view.KeyEvent
+import com.nayem.liveagent.service.LiveAccessibilityService
+import java.io.File
+import java.net.URLEncoder
+
+data class ToolResult(val success: Boolean, val detail: String)
+
+class PhoneTools(private val context: Context) {
+
+    private fun isPackageInstalled(packageName: String): Boolean {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.packageManager.getPackageInfo(
+                    packageName,
+                    PackageManager.PackageInfoFlags.of(0)
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                context.packageManager.getPackageInfo(packageName, 0)
+            }
+            true
+        } catch (e: PackageManager.NameNotFoundException) {
+            false
+        }
+    }
+
+    private fun launchableApps(): List<Pair<String, String>> {
+        val intent = Intent(Intent.ACTION_MAIN).apply {
+            addCategory(Intent.CATEGORY_LAUNCHER)
+        }
+        val resolveInfos = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.packageManager.queryIntentActivities(
+                intent,
+                PackageManager.ResolveInfoFlags.of(PackageManager.MATCH_ALL.toLong())
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            context.packageManager.queryIntentActivities(intent, PackageManager.MATCH_ALL)
+        }
+        return resolveInfos.map { info ->
+            val label = info.loadLabel(context.packageManager)?.toString()
+                ?: info.activityInfo.packageName
+            label to info.activityInfo.packageName
+        }.sortedBy { it.first.lowercase() }
+    }
+
+    fun openAppByName(name: String): ToolResult {
+        if (name.isBlank()) return ToolResult(false, "App name is empty")
+        val query = name.trim().lowercase()
+        val match = launchableApps().firstOrNull { (label, pkg) ->
+            label.lowercase().contains(query) || pkg.lowercase().contains(query)
+        } ?: return ToolResult(false, "App not found: $name")
+        val launchIntent = context.packageManager
+            .getLaunchIntentForPackage(match.second)
+            ?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            ?: return ToolResult(false, "No launch intent for ${match.first}")
+        return try {
+            context.startActivity(launchIntent)
+            ToolResult(true, "Opened ${match.first} (${match.second})")
+        } catch (e: Exception) {
+            ToolResult(false, "Failed to open ${match.first}: ${e.message}")
+        }
+    }
+
+    fun openChrome(url: String): ToolResult {
+        val target = if (url.startsWith("http://") || url.startsWith("https://")) {
+            url
+        } else {
+            "https://$url"
+        }
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(target)).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            if (isPackageInstalled("com.android.chrome")) {
+                setPackage("com.android.chrome")
+            }
+        }
+        return try {
+            context.startActivity(intent)
+            ToolResult(true, "Opened $target in Chrome")
+        } catch (e: Exception) {
+            ToolResult(false, "Failed to open $target: ${e.message}")
+        }
+    }
+
+    fun openYouTubeSearch(query: String): ToolResult {
+        val encoded = URLEncoder.encode(query, "UTF-8")
+        val uri = Uri.parse("https://www.youtube.com/results?search_query=$encoded")
+        val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            if (isPackageInstalled("com.google.android.youtube")) {
+                setPackage("com.google.android.youtube")
+            }
+        }
+        return try {
+            context.startActivity(intent)
+            ToolResult(true, "YouTube search: $query")
+        } catch (e: Exception) {
+            ToolResult(false, "Failed to search YouTube for \"$query\": ${e.message}")
+        }
+    }
+
+    fun openNoteApp(packageName: String?, title: String, text: String): ToolResult {
+        if (!packageName.isNullOrBlank()) {
+            val launchIntent = context.packageManager
+                .getLaunchIntentForPackage(packageName)
+                ?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                ?: return ToolResult(false, "Note app not found: $packageName")
+            return try {
+                context.startActivity(launchIntent)
+                ToolResult(true, "Opened note app $packageName (title: $title)")
+            } catch (e: Exception) {
+                ToolResult(false, "Failed to open $packageName: ${e.message}")
+            }
+        }
+        val match = launchableApps().firstOrNull { (label, _) ->
+            val lower = label.lowercase()
+            lower.contains("note") || lower.contains("keep") || lower.contains("notepad")
+        } ?: return ToolResult(false, "No note app found on this device")
+        val launchIntent = context.packageManager
+            .getLaunchIntentForPackage(match.second)
+            ?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            ?: return ToolResult(false, "No launch intent for ${match.first}")
+        return try {
+            context.startActivity(launchIntent)
+            ToolResult(true, "Opened ${match.first} (${match.second}) for note \"$title\"")
+        } catch (e: Exception) {
+            ToolResult(false, "Failed to open ${match.first}: ${e.message}")
+        }
+    }
+
+    fun makeCall(number: String): ToolResult {
+        if (context.checkSelfPermission(Manifest.permission.CALL_PHONE)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            return ToolResult(
+                false,
+                "CALL_PHONE permission not granted — cannot call $number"
+            )
+        }
+        val intent = Intent(Intent.ACTION_CALL, Uri.parse("tel:$number")).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        return try {
+            context.startActivity(intent)
+            ToolResult(true, "Calling $number")
+        } catch (e: Exception) {
+            ToolResult(false, "Failed to call $number: ${e.message}")
+        }
+    }
+
+    fun sendSms(number: String, text: String): ToolResult {
+        if (context.checkSelfPermission(Manifest.permission.SEND_SMS)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            return ToolResult(
+                false,
+                "SEND_SMS permission not granted — cannot send SMS to $number"
+            )
+        }
+        return try {
+            val smsManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                context.getSystemService(SmsManager::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                SmsManager.getDefault()
+            }
+            smsManager.sendTextMessage(number, null, text, null, null)
+            ToolResult(true, "SMS sent to $number")
+        } catch (e: Exception) {
+            ToolResult(false, "Failed to send SMS to $number: ${e.message}")
+        }
+    }
+
+    fun openWhatsApp(number: String, text: String): ToolResult {
+        val digits = number.filter { it.isDigit() }
+        if (digits.isEmpty()) return ToolResult(false, "Invalid WhatsApp number: $number")
+        val encoded = URLEncoder.encode(text, "UTF-8")
+        val uri = Uri.parse("https://wa.me/$digits?text=$encoded")
+        val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            if (isPackageInstalled("com.whatsapp")) {
+                setPackage("com.whatsapp")
+            }
+        }
+        return try {
+            context.startActivity(intent)
+            ToolResult(true, "Opened WhatsApp chat with $digits")
+        } catch (e: Exception) {
+            ToolResult(false, "Failed to open WhatsApp for $digits: ${e.message}")
+        }
+    }
+
+    fun takeScreenshotFile(): File? {
+        return LiveAccessibilityService.instance?.takeScreenshotToFile(context)
+    }
+
+    fun listApps(): List<Pair<String, String>> = launchableApps()
+
+    fun pauseMedia(): ToolResult {
+        return try {
+            val audioManager =
+                context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            val dispatched = run {
+                audioManager.dispatchMediaKeyEvent(
+                    KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PAUSE)
+                )
+                audioManager.dispatchMediaKeyEvent(
+                    KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PAUSE)
+                )
+                true
+            }
+            if (!dispatched) {
+                audioManager.dispatchMediaKeyEvent(
+                    KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_STOP)
+                )
+                audioManager.dispatchMediaKeyEvent(
+                    KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_STOP)
+                )
+            }
+            ToolResult(true, "Media pause key event dispatched")
+        } catch (e: Exception) {
+            ToolResult(false, "Failed to pause media: ${e.message}")
+        }
+    }
+}
