@@ -36,9 +36,11 @@ import com.nayem.liveagent.ui.AuditScreen
 import com.nayem.liveagent.ui.HeadingFont
 import com.nayem.liveagent.ui.LiveAgentTheme
 import com.nayem.liveagent.ui.LiveScreen
+import com.nayem.liveagent.ui.McpScreen
 import com.nayem.liveagent.ui.MemoryScreen
 import com.nayem.liveagent.ui.MoreScreen
 import com.nayem.liveagent.ui.RoutinesScreen
+import com.nayem.liveagent.ui.ScreenControlScreen
 import com.nayem.liveagent.ui.SettingsScreen
 import com.nayem.liveagent.ui.SkillsScreen
 import com.nayem.liveagent.ui.TerminalScreen
@@ -113,7 +115,7 @@ fun MainScreen() {
             modifier = Modifier.padding(padding)
         ) {
             when (tab) {
-                "live" -> LiveScreen()
+                "live" -> LiveScreen(onOpenSettings = { tab = "settings" })
                 "tasks" -> AgentScreen()
                 "skills" -> SkillsScreen()
                 "memory" -> MemoryScreen()
@@ -121,8 +123,10 @@ fun MainScreen() {
                 "settings" -> SettingsScreen(onBack = { tab = "more" })
                 "terminal" -> TerminalScreen(onBack = { tab = "more" })
                 "routines" -> RoutinesScreen(onBack = { tab = "more" })
+                "mcp" -> McpScreen(onBack = { tab = "more" })
+                "screen" -> ScreenControlScreen(onBack = { tab = "more" })
                 "audit" -> AuditScreen(onBack = { tab = "more" })
-                else -> LiveScreen()
+                else -> LiveScreen(onOpenSettings = { tab = "settings" })
             }
         }
     }
