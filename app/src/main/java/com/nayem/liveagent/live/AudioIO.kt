@@ -1,5 +1,8 @@
 package com.nayem.liveagent.live
 
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioRecord
@@ -7,13 +10,15 @@ import android.media.AudioTrack
 import android.media.MediaRecorder
 
 /** Microphone capture: 16 kHz mono PCM16, 100 ms chunks. User-initiated only. */
-class MicCapture(private val onPcm: (ByteArray) -> Unit) {
+class MicCapture(private val context: Context, private val onPcm: (ByteArray) -> Unit) {
     @Volatile private var running = false
     private var thread: Thread? = null
     private var recorder: AudioRecord? = null
 
     fun start() {
         if (running) return
+        // Explicit permission check (also satisfies lint's MissingPermission).
+        if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return
         val minBuf = AudioRecord.getMinBufferSize(
             16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
         ).coerceAtLeast(6400)
