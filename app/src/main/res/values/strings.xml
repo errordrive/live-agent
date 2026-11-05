@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Live Agent</string>
+    <string name="accessibility_description">Live Agent uses accessibility to operate your phone on your voice commands — tap buttons, type text, scroll, go back/home, and lock the screen. Enable it only if you want the agent to control apps for you.</string>
+</resources>
