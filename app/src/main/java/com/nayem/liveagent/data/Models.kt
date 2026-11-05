@@ -160,4 +160,4 @@ fun defaultSkills(): List<Skill> = listOf(
         steps = listOf("planner: fetch news and weather", "speak: briefing"),
         permissions = listOf("internet"), needsConfirmation = false
     )
-)
+) + extraSkills()
