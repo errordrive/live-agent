@@ -225,7 +225,7 @@ fun LiveScreen() {
         liveClient = client
         try {
             client.connect()
-            val capture = MicCapture { pcm -> client.sendAudioPcm16(pcm) }
+            val capture = MicCapture(context) { pcm -> client.sendAudioPcm16(pcm) }
             mic = capture
             capture.start()
         } catch (e: Exception) {
