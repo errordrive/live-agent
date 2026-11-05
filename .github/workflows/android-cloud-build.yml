@@ -23,6 +23,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # gradlew loses its executable bit when pushed via the GitHub Contents
+      # API (blobs are created mode 100644), so restore it before running it.
+      - name: Make Gradle wrapper executable
+        run: chmod +x gradlew
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
