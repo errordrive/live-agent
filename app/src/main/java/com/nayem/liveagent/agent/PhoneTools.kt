@@ -204,6 +204,69 @@ class PhoneTools(private val context: Context) {
         return LiveAccessibilityService.instance?.takeScreenshotToFile(context)
     }
 
+    /** Full hands-free screen control (requires the accessibility service). */
+    fun screenTapText(text: String): ToolResult {
+        val svc = LiveAccessibilityService.instance
+            ?: return ToolResult(false, "Accessibility service is not enabled — enable it in Settings")
+        return if (svc.tapText(text)) ToolResult(true, "Tapped \"$text\"")
+        else ToolResult(false, "Could not find \"$text\" on screen")
+    }
+
+    fun screenTapAt(x: Float, y: Float): ToolResult {
+        val svc = LiveAccessibilityService.instance
+            ?: return ToolResult(false, "Accessibility service is not enabled — enable it in Settings")
+        return if (svc.tapAt(x, y)) ToolResult(true, "Tapped at ${x.toInt()},${y.toInt()}")
+        else ToolResult(false, "Tap at ${x.toInt()},${y.toInt()} failed")
+    }
+
+    fun screenTapById(viewId: String): ToolResult {
+        val svc = LiveAccessibilityService.instance
+            ?: return ToolResult(false, "Accessibility service is not enabled — enable it in Settings")
+        return if (svc.tapById(viewId)) ToolResult(true, "Tapped $viewId")
+        else ToolResult(false, "Could not find view $viewId")
+    }
+
+    fun screenLongPressText(text: String): ToolResult {
+        val svc = LiveAccessibilityService.instance
+            ?: return ToolResult(false, "Accessibility service is not enabled — enable it in Settings")
+        return if (svc.longPressText(text)) ToolResult(true, "Long-pressed \"$text\"")
+        else ToolResult(false, "Could not long-press \"$text\"")
+    }
+
+    fun screenSwipe(x1: Float, y1: Float, x2: Float, y2: Float): ToolResult {
+        val svc = LiveAccessibilityService.instance
+            ?: return ToolResult(false, "Accessibility service is not enabled — enable it in Settings")
+        return if (svc.swipe(x1, y1, x2, y2)) ToolResult(true, "Swiped")
+        else ToolResult(false, "Swipe failed")
+    }
+
+    fun screenScroll(direction: String): ToolResult {
+        val svc = LiveAccessibilityService.instance
+            ?: return ToolResult(false, "Accessibility service is not enabled — enable it in Settings")
+        val ok = if (direction == "up") svc.scrollUp() else svc.scrollDown()
+        return if (ok) ToolResult(true, "Scrolled $direction") else ToolResult(false, "Nothing to scroll")
+    }
+
+    fun screenPress(action: String): ToolResult {
+        val svc = LiveAccessibilityService.instance
+            ?: return ToolResult(false, "Accessibility service is not enabled — enable it in Settings")
+        val ok = when (action) {
+            "back" -> svc.pressBack()
+            "home" -> svc.pressHome()
+            "recents" -> svc.pressRecents()
+            "lock" -> svc.lockScreen()
+            else -> false
+        }
+        return if (ok) ToolResult(true, "Pressed $action") else ToolResult(false, "Press $action failed")
+    }
+
+    fun screenVolume(direction: String): ToolResult {
+        val svc = LiveAccessibilityService.instance
+            ?: return ToolResult(false, "Accessibility service is not enabled — enable it in Settings")
+        val ok = if (direction == "up") svc.volumeUp() else svc.volumeDown()
+        return if (ok) ToolResult(true, "Volume $direction") else ToolResult(false, "Volume $direction failed")
+    }
+
     fun listApps(): List<Pair<String, String>> = launchableApps()
 
     fun pauseMedia(): ToolResult {
