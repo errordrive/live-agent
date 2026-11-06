@@ -12,6 +12,10 @@ import okio.ByteString
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 sealed interface LiveEvent {
     data class Connected(val model: String) : LiveEvent
@@ -22,6 +26,16 @@ sealed interface LiveEvent {
     data object Interrupted : LiveEvent
     data class Error(val message: String) : LiveEvent
     data object SetupComplete : LiveEvent
+    /** Socket handshake finished; the setup message is about to be sent. */
+    data object SocketOpened : LiveEvent
+    /** Setup message was sent; now waiting for the server's setupComplete. */
+    data object SetupSent : LiveEvent
+    /**
+     * A raw frame arrived before setup completed (first ~160 chars only).
+     * Logged so a silent server leaves evidence of exactly what, if anything,
+     * came back — audio payloads are never logged once connected.
+     */
+    data class RawFrame(val summary: String) : LiveEvent
 }
 
 /**
@@ -37,11 +51,15 @@ class GeminiLiveClient(
     private val model: String,
     private val voice: String,
     private val systemPrompt: String,
-    private val onEvent: (LiveEvent) -> Unit
+    private val onEvent: (LiveEvent) -> Unit,
+    /** Retry-only fallback: model + responseModalities, nothing else. */
+    private val minimalSetup: Boolean = false
 ) {
     private val client = OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
-        .connectTimeout(30, TimeUnit.SECONDS)
+        // 15 s, not 30: a dead network must fail fast with a visible error
+        // instead of leaving the UI on "Connecting..." for half a minute.
+        .connectTimeout(15, TimeUnit.SECONDS)
         .build()
     private var socket: WebSocket? = null
     @Volatile var isConnected: Boolean = false
@@ -63,29 +81,52 @@ class GeminiLiveClient(
         val request = Request.Builder().url(url).build()
         socket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                onEvent(LiveEvent.SocketOpened)
+                // Setup shape (per ai.google.dev Live API docs): speechConfig
+                // belongs INSIDE generationConfig, not as a sibling of it.
+                // The old shape (speechConfig beside generationConfig) made the
+                // server stay silent — socket opened, setup sent, but no
+                // setupComplete ever arrived. systemInstruction and the
+                // transcription flags stay at setup top level (correct there).
                 val setup = JSONObject().apply {
                     put("setup", JSONObject().apply {
                         put("model", "models/$model")
-                        put("generationConfig", JSONObject().apply {
-                            put("responseModalities", org.json.JSONArray().put("AUDIO"))
-                        })
-                        put("systemInstruction", JSONObject().apply {
-                            put("parts", org.json.JSONArray().put(
-                                JSONObject().put("text", systemPrompt)
-                            ))
-                        })
-                        put("speechConfig", JSONObject().apply {
-                            put("voiceConfig", JSONObject().apply {
-                                put("prebuiltVoiceConfig", JSONObject().apply {
-                                    put("voiceName", voice)
+                        if (minimalSetup) {
+                            // Retry fallback: model + responseModalities only.
+                            put("generationConfig", JSONObject().apply {
+                                put("responseModalities", org.json.JSONArray().put("AUDIO"))
+                            })
+                        } else {
+                            put("generationConfig", JSONObject().apply {
+                                put("responseModalities", org.json.JSONArray().put("AUDIO"))
+                                put("speechConfig", JSONObject().apply {
+                                    put("voiceConfig", JSONObject().apply {
+                                        put("prebuiltVoiceConfig", JSONObject().apply {
+                                            put("voiceName", voice)
+                                        })
+                                    })
                                 })
                             })
-                        })
-                        put("inputAudioTranscription", JSONObject())
-                        put("outputAudioTranscription", JSONObject())
+                            put("systemInstruction", JSONObject().apply {
+                                put("parts", org.json.JSONArray().put(
+                                    JSONObject().put("text", systemPrompt)
+                                ))
+                            })
+                            put("inputAudioTranscription", JSONObject())
+                            put("outputAudioTranscription", JSONObject())
+                        }
                     })
                 }
-                webSocket.send(setup.toString())
+                // send() returns false (instead of throwing) when the socket
+                // is already dead — surface that instead of waiting 20 s for
+                // a setupComplete that can never arrive.
+                val sent = try { webSocket.send(setup.toString()) } catch (_: Exception) { false }
+                if (!sent) {
+                    onEvent(LiveEvent.Error("Could not send setup to the server"))
+                    disconnect()
+                    return
+                }
+                onEvent(LiveEvent.SetupSent)
                 startSetupTimeout()
             }
 
@@ -100,9 +141,12 @@ class GeminiLiveClient(
                 val detail = t.message?.takeIf { it.isNotBlank() }
                     ?: response?.message?.takeIf { it.isNotBlank() }
                     ?: "Connection failed"
+                // Include the failure kind (e.g. UnknownHostException) — it is
+                // the difference between "no internet" and "key rejected".
+                val kind = t.javaClass.simpleName
                 val code = response?.code
                 val message = if (code != null) "WebSocket failed (HTTP $code): $detail"
-                else "WebSocket failed: $detail"
+                else "WebSocket failed ($kind): $detail"
                 onEvent(LiveEvent.Error(message))
                 onEvent(LiveEvent.Disconnected(message))
             }
@@ -181,6 +225,11 @@ class GeminiLiveClient(
     }
 
     private fun handleMessage(raw: String) {
+        // Raw-frame evidence, only before setup completes: if the server ever
+        // stays silent again, the log shows exactly which frames arrived.
+        if (!isConnected) {
+            try { onEvent(LiveEvent.RawFrame(raw.take(160))) } catch (_: Exception) {}
+        }
         try {
             val json = JSONObject(raw)
             if (json.has("error")) {
@@ -246,5 +295,38 @@ class GeminiLiveClient(
         } catch (_: Exception) {
             // Malformed frames must never crash the session.
         }
+    }
+}
+
+/**
+ * One-shot live check for Settings ("Test live connection"): opens the real
+ * Live socket, sends setup, and waits for setupComplete (max 20 s).
+ * Returns plain success or the exact server error / HTTP code / timeout.
+ * Never touches the REST key test — the socket reports its own errors.
+ */
+suspend fun testLiveConnection(
+    apiKey: String,
+    model: String,
+    voice: String,
+    systemPrompt: String
+): String = withContext(Dispatchers.IO) {
+    val done = CompletableDeferred<String>()
+    val client = GeminiLiveClient(apiKey, model, voice, systemPrompt) { event ->
+        when (event) {
+            is LiveEvent.SetupComplete -> done.complete("Live connected OK ($model)")
+            is LiveEvent.Connected -> { /* SetupComplete already reports success */ }
+            is LiveEvent.Error -> done.complete("Live connection failed: ${event.message}")
+            is LiveEvent.Disconnected -> done.complete("Live connection closed: ${event.reason}")
+            else -> { /* audio/transcripts are irrelevant for the test */ }
+        }
+    }
+    try {
+        client.connect()
+        withTimeoutOrNull(20_000L) { done.await() }
+            ?: "Timed out after 20s — no setupComplete received (check key and network)"
+    } catch (e: Exception) {
+        "Live connection failed: ${e.message}"
+    } finally {
+        try { client.disconnect() } catch (_: Exception) {}
     }
 }
