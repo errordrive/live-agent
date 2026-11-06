@@ -54,7 +54,16 @@ class MicCapture(private val context: Context, private val onPcm: (ByteArray) ->
         if (rec.state != AudioRecord.STATE_INITIALIZED) { rec.release(); return }
         recorder = rec
         running = true
-        rec.startRecording()
+        try {
+            rec.startRecording()
+        } catch (_: Exception) {
+            // startRecording can throw (e.g. mic in use by another app) —
+            // never crash the call; the transcript still works.
+            running = false
+            try { rec.release() } catch (_: Exception) {}
+            recorder = null
+            return
+        }
         thread = Thread({
             val buf = ByteArray(3200)
             while (running) {
@@ -74,7 +83,9 @@ class MicCapture(private val context: Context, private val onPcm: (ByteArray) ->
         running = false
         try { thread?.join(500) } catch (_: Exception) {}
         thread = null
-        try { recorder?.stop(); recorder?.release() } catch (_: Exception) {}
+        // Stop/release can throw if the recorder died mid-call — never crash.
+        try { recorder?.stop() } catch (_: Exception) {}
+        try { recorder?.release() } catch (_: Exception) {}
         recorder = null
     }
 }
@@ -101,8 +112,11 @@ class AudioPlayer {
                 ).coerceAtLeast(9600)
                 t = AudioTrack.Builder()
                     .setAudioAttributes(
+                        // LOUDSPEAKER (v1.2.0): USAGE_MEDIA routes to the
+                        // loudspeaker by default. The old USAGE_VOICE_COMMUNICATION
+                        // routed call audio to the earpiece like a phone call.
                         AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
                             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                             .build()
                     )
@@ -116,6 +130,10 @@ class AudioPlayer {
                     .setBufferSizeInBytes(minBuf * 4)
                     .setTransferMode(AudioTrack.MODE_STREAM)
                     .build()
+                if (t.state != AudioTrack.STATE_INITIALIZED) {
+                    try { t.release() } catch (_: Exception) {}
+                    return
+                }
                 track = t
             }
             if (t.playState != AudioTrack.PLAYSTATE_PLAYING) t.play()
