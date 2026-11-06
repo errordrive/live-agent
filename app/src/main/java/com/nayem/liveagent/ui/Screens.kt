@@ -348,10 +348,6 @@ fun LiveScreen(onOpenSettings: () -> Unit = {}) {
         onDispose { stopLive() }
     }
 
-    fun startLive() {
-        startCall(settings.model, isRetry = false, minimal = false)
-    }
-
     /**
      * One connection attempt. `isRetry` is true only for the single automatic
      * retry: model gemini-3.8-live-extended-thinking with a MINIMAL setup
@@ -513,6 +509,12 @@ fun LiveScreen(onOpenSettings: () -> Unit = {}) {
             status = lastError
             stage = "Failed"
         }
+    }
+
+    // Declared after startCall: local functions are only visible below
+    // their declaration point, so startLive cannot sit above it.
+    fun startLive() {
+        startCall(settings.model, isRetry = false, minimal = false)
     }
 
     Column(
