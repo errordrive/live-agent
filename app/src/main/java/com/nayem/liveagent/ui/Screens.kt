@@ -6,6 +6,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioManager
 import android.net.Uri
 import android.os.PowerManager
 import android.provider.Settings
@@ -43,6 +44,9 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Cancel
+import androidx.compose.material.icons.filled.VolumeOff
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
@@ -78,6 +82,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
@@ -104,6 +109,9 @@ import com.nayem.liveagent.agent.ToolResult
 import com.nayem.liveagent.data.AppSettings
 import com.nayem.liveagent.data.AuditEntry
 import com.nayem.liveagent.data.ChatMessage
+import com.nayem.liveagent.data.CrashLog
+import com.nayem.liveagent.data.VoiceTaskHistory
+import com.nayem.liveagent.data.VoiceTaskStatus
 import com.nayem.liveagent.data.MemoryAuto
 import com.nayem.liveagent.data.MemoryEntry
 import com.nayem.liveagent.data.PlanStep
@@ -117,17 +125,22 @@ import com.nayem.liveagent.live.GeminiLiveClient
 import com.nayem.liveagent.live.GeminiRestClient
 import com.nayem.liveagent.live.LiveEvent
 import com.nayem.liveagent.live.MicCapture
+import com.nayem.liveagent.live.VoiceFallback
 import com.nayem.liveagent.live.testLiveConnection
 import com.nayem.liveagent.mcp.McpServerConfig
 import com.nayem.liveagent.mcp.McpStore
+import com.nayem.liveagent.service.FloatingBubbleService
 import com.nayem.liveagent.service.LiveAccessibilityService
+import com.nayem.liveagent.service.OverlayState
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
@@ -239,6 +252,36 @@ fun TalkingOrb(
 // Live tab
 // ---------------------------------------------------------------------------
 
+/**
+ * True when a voice/typed message is an action request, not small talk.
+ * English + Bangla (script and transliteration). Used by the Live tab to route
+ * final user transcripts into the agent loop instead of only chatting.
+ */
+private fun isActionRequest(text: String): Boolean {
+    val t = text.lowercase()
+    val keywords = listOf(
+        "open", "research", "search", "note", "write", "play", "call", "send",
+        "timer", "scroll", "tap", "click", "turn", "set ", "remind", "keep",
+        "chrome", "youtube", "screen", "lock", "run", "stop", "pause", "volume",
+        "type", "save", "find", "look", "check", "launch", "start ",
+        "খোল", "খুল", "রিসার্চ", "খুঁজ", "নোট", "লিখ", "চালা", "কল", "পাঠা",
+        "স্ক্রিন", "দেখ", "বন্ধ", "টাইমার", "সেভ", "ওপেন"
+    )
+    return keywords.any { t.contains(it) }
+}
+
+/** True when the user asks the agent to look at / read what's on the screen. */
+private fun isReadScreenRequest(text: String): Boolean {
+    val t = text.lowercase()
+    val mentionsScreen = t.contains("screen") || t.contains("স্ক্রিন")
+    if (!mentionsScreen) return false
+    val asksToLook = listOf(
+        "dekho", "dekh", "ki ache", "what", "see", "read", "show", "look",
+        "describe", "দেখ"
+    ).any { t.contains(it) }
+    return asksToLook
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LiveScreen(onOpenSettings: () -> Unit = {}) {
@@ -272,6 +315,21 @@ fun LiveScreen(onOpenSettings: () -> Unit = {}) {
     var connLog by remember { mutableStateOf<List<String>>(emptyList()) }
     var attemptCounter by remember { mutableIntStateOf(0) }
     var retriedThisCall by remember { mutableStateOf(false) }
+
+    // Voice → action (v1.2.0): loudspeaker, working state, screen reading,
+    // per-step confirmation, voice-task history.
+    val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    val voiceFallback = remember { VoiceFallback(context) }
+    var speakerOn by remember { mutableStateOf(true) }
+    var agentWorking by remember { mutableStateOf(false) }
+    var workingGoal by remember { mutableStateOf("") }
+    var screenReading by remember { mutableStateOf("") }
+    var screenReadingBusy by remember { mutableStateOf(false) }
+    var pendingLiveStep by remember { mutableStateOf<PlanStep?>(null) }
+    var pendingLiveDeferred by remember { mutableStateOf<CompletableDeferred<Boolean>?>(null) }
+    var lastVoiceTaskText by remember { mutableStateOf("") }
+    var lastVoiceTaskAtMs by remember { mutableLongStateOf(0L) }
+    val voiceTasks by VoiceTaskHistory.tasks.collectAsState()
 
     fun logLine(message: String) {
         val stamped = "${formatLogTime(System.currentTimeMillis())} $message"
@@ -342,10 +400,171 @@ fun LiveScreen(onOpenSettings: () -> Unit = {}) {
         stage = "Idle"
         startedAt = 0L
         elapsedSec = 0
+        // Loudspeaker off again when the call ends (v1.2.0).
+        try { audioManager.isSpeakerphoneOn = false } catch (_: Exception) {}
+        try { FloatingBubbleService.stop(context) } catch (_: Exception) {}
     }
 
     DisposableEffect(Unit) {
-        onDispose { stopLive() }
+        onDispose {
+            stopLive()
+            try { voiceFallback.shutdown() } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * Loudspeaker (v1.2.0): call audio plays on the loudspeaker by default.
+     * USAGE_MEDIA in AudioPlayer does the routing; forcing speakerphone on
+     * here makes it hold even if the system would otherwise pick the earpiece.
+     * MODE_NORMAL (not MODE_IN_COMMUNICATION) keeps the phone out of
+     * call mode. Restored to speakerphone-off by stopLive().
+     */
+    fun applySpeaker() {
+        try {
+            if (speakerOn && (connected || callActive)) {
+                audioManager.mode = AudioManager.MODE_NORMAL
+                audioManager.isSpeakerphoneOn = true
+            } else {
+                audioManager.isSpeakerphoneOn = false
+            }
+        } catch (_: Exception) {}
+    }
+
+    /** Floating bubble follows the call/task state (v1.2.0, optional overlay). */
+    fun syncBubble() {
+        try {
+            if (!OverlayState.isOverlayAllowed(context) || !OverlayState.overlayEnabled) return
+            if (callActive || agentWorking) {
+                val state = when {
+                    agentWorking -> "Working on ${workingGoal.ifBlank { "your task" }.take(40)}"
+                    speaking -> "Speaking"
+                    connected -> "Listening"
+                    else -> "Connecting..."
+                }
+                if (FloatingBubbleService.isShowing()) FloatingBubbleService.updateState(context, state)
+                else FloatingBubbleService.start(context, state)
+            } else {
+                FloatingBubbleService.stop(context)
+            }
+        } catch (_: Exception) {}
+    }
+
+    // Loudspeaker + floating bubble follow the call state.
+    LaunchedEffect(connected, speaking, agentWorking, callActive, speakerOn) {
+        applySpeaker()
+        syncBubble()
+    }
+
+    /**
+     * Voice → ACTION (v1.2.0): run a spoken goal through the agent loop.
+     * Direct orchestrator call (the same buildPlan/executePlan the Tasks tab
+     * already makes) — no queue engine. The call stays live while the task
+     * runs on a background coroutine; when it finishes, the result is spoken
+     * back INSIDE the Live call as a text turn (Android TTS only if the
+     * session is down). Risky steps ask once via the confirm dialog below
+     * (hard rules: send/delete/shell need an explicit yes, every time).
+     */
+    fun runVoiceTask(goal: String) {
+        val cleanGoal = goal.trim()
+        if (cleanGoal.isBlank()) return
+        // Vision grounding needs the current key, not the one captured when
+        // the app started (the key is usually added after first launch).
+        try { LiveAgentApp.orchestrator.screenControl.apiKey = secure.geminiApiKey } catch (_: Exception) {}
+        val id = UUID.randomUUID().toString()
+        agentWorking = true
+        workingGoal = cleanGoal
+        val job = scope.launch {
+            try {
+                val plan = LiveAgentApp.orchestrator.buildPlan(cleanGoal)
+                val needsApproval = plan.needsConfirmation || plan.steps.any { it.risky }
+                var planApproved: Boolean? = null
+                val results = LiveAgentApp.orchestrator.executePlan(
+                    plan,
+                    onStep = { _, message -> workingGoal = "$cleanGoal — $message" },
+                    confirm = { step ->
+                        when {
+                            !step.risky && !needsApproval -> true
+                            !step.risky && planApproved != null -> planApproved == true
+                            else -> {
+                                val deferred = CompletableDeferred<Boolean>()
+                                pendingLiveDeferred = deferred
+                                pendingLiveStep = step
+                                val ok = try { deferred.await() } catch (_: Exception) { false }
+                                pendingLiveStep = null
+                                pendingLiveDeferred = null
+                                if (!step.risky) planApproved = ok
+                                ok
+                            }
+                        }
+                    }
+                )
+                val okCount = results.count { it.second.success }
+                val detail = results.joinToString("\n") { (step, r) ->
+                    "- ${step.description}: ${if (r.success) "done" else "failed — ${r.detail}"}"
+                }.take(600)
+                val summary = "Task finished: $okCount of ${results.size} steps done.\n$detail"
+                val allOk = okCount == results.size && results.isNotEmpty()
+                VoiceTaskHistory.update(
+                    id,
+                    if (allOk) VoiceTaskStatus.DONE else VoiceTaskStatus.FAILED,
+                    summary
+                )
+                if (connected && liveClient != null) {
+                    liveClient?.sendText(
+                        "The task '$cleanGoal' finished. Result:\n$summary\n" +
+                            "Tell the user a short spoken summary in the language they spoke " +
+                            "(Bangla if they spoke Bangla)."
+                    )
+                    appendTranscript("agent", summary, true)
+                } else {
+                    voiceFallback.speak(summary)
+                    appendTranscript("agent", summary, true)
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // Cancelled from the Tasks tab — status was already set to CANCELLED.
+                throw e
+            } catch (e: Exception) {
+                val msg = "Task failed: ${e.message}"
+                VoiceTaskHistory.update(id, VoiceTaskStatus.FAILED, msg)
+                if (connected && liveClient != null) {
+                    liveClient?.sendText("The task '$cleanGoal' failed: ${e.message}. Tell the user briefly.")
+                }
+                appendTranscript("agent", msg, true)
+            } finally {
+                agentWorking = false
+                workingGoal = ""
+            }
+        }
+        VoiceTaskHistory.add(
+            com.nayem.liveagent.data.VoiceTaskRecord(
+                id, cleanGoal, VoiceTaskStatus.RUNNING, "Started",
+                System.currentTimeMillis(), job
+            )
+        )
+    }
+
+    /** "See screen" (v1.2.0): read the screen, show it, and speak it in-call. */
+    fun runReadScreen() {
+        try { LiveAgentApp.orchestrator.screenControl.apiKey = secure.geminiApiKey } catch (_: Exception) {}
+        screenReadingBusy = true
+        scope.launch {
+            val text = withContext(Dispatchers.IO) {
+                try {
+                    LiveAgentApp.orchestrator.screenControl.readScreen()
+                } catch (e: Exception) {
+                    "Could not read screen: ${e.message}"
+                }
+            }
+            screenReading = text
+            screenReadingBusy = false
+            if (connected && liveClient != null) {
+                liveClient?.sendText(
+                    "I read the phone screen. Here is what is visible:\n$text\n" +
+                        "Tell the user a short spoken summary in the language they spoke."
+                )
+            }
+            appendTranscript("agent", "Screen: $text", true)
+        }
     }
 
     /**
@@ -385,8 +604,14 @@ fun LiveScreen(onOpenSettings: () -> Unit = {}) {
         liveClient = null
         val key = secure.geminiApiKey
         val personaSuffix = Personas.firstOrNull { it.first == persona }?.second.orEmpty()
-        val prompt = if (personaSuffix.isBlank()) settings.systemPrompt
-        else settings.systemPrompt + "\nPersona: $personaSuffix"
+        // Action capability (v1.2.0): appended on every call so the model
+        // says it WILL act — even if the stored system prompt is the old
+        // one from before v1.2.0. The app actually executes via runVoiceTask.
+        val actionLine = "\n\nYou CAN act on this phone: open apps, browse Chrome, research topics, " +
+            "write notes in Google Keep, control the screen. When the user asks you to do " +
+            "something, say you will do it and do it. Never say you cannot browse or save notes."
+        val prompt = settings.systemPrompt +
+            (if (personaSuffix.isBlank()) "" else "\nPersona: $personaSuffix") + actionLine
         attemptCounter += 1
         val myAttempt = attemptCounter
         status = if (isRetry) "Retrying with extended-thinking (minimal setup)..."
@@ -440,6 +665,23 @@ fun LiveScreen(onOpenSettings: () -> Unit = {}) {
                 }
                 is LiveEvent.UserTranscript -> {
                     appendTranscript("user", event.text, event.isFinal)
+                    // Voice → ACTION (v1.2.0): a final user transcript that
+                    // asks for something is routed into the agent loop.
+                    // Dedup: the same text within 8 s is one request, not two.
+                    if (event.isFinal) {
+                        val text = event.text.trim()
+                        val now = System.currentTimeMillis()
+                        if (text.isNotBlank() &&
+                            !(text == lastVoiceTaskText && now - lastVoiceTaskAtMs < 8000)
+                        ) {
+                            lastVoiceTaskText = text
+                            lastVoiceTaskAtMs = now
+                            when {
+                                isReadScreenRequest(text) -> runReadScreen()
+                                isActionRequest(text) -> runVoiceTask(text)
+                            }
+                        }
+                    }
                 }
                 is LiveEvent.AgentTranscript -> {
                     speaking = !event.isFinal
@@ -666,6 +908,41 @@ fun LiveScreen(onOpenSettings: () -> Unit = {}) {
                     fontSize = 13.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+                Spacer(Modifier.height(8.dp))
+                // Loudspeaker (v1.2.0): on by default — call audio on the speaker, not the earpiece.
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(
+                        if (speakerOn) Icons.Filled.VolumeUp else Icons.Filled.VolumeOff,
+                        contentDescription = null
+                    )
+                    Text("Loudspeaker", fontSize = 14.sp, modifier = Modifier.weight(1f))
+                    Switch(
+                        checked = speakerOn,
+                        onCheckedChange = { speakerOn = it; applySpeaker() }
+                    )
+                }
+                Spacer(Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = { runReadScreen() },
+                    enabled = !screenReadingBusy,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(Icons.Filled.Visibility, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text(if (screenReadingBusy) "Reading screen..." else "See screen")
+                }
+                if (agentWorking) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "Agent is working: $workingGoal",
+                        fontSize = 14.sp,
+                        color = Color(0xFFB08D57)
+                    )
+                }
                 if (micPermissionNeeded) {
                     Spacer(Modifier.height(8.dp))
                     OutlinedButton(onClick = {
@@ -729,6 +1006,37 @@ fun LiveScreen(onOpenSettings: () -> Unit = {}) {
                     }
                 }
             }
+            // Voice tasks (v1.2.0): what the agent is doing / did from voice.
+            if (voiceTasks.isNotEmpty()) {
+                Spacer(Modifier.height(8.dp))
+                Text("Voice tasks", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                voiceTasks.take(3).forEach { task ->
+                    Column(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                    ) {
+                        Text(task.goal, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                        Text(
+                            "${task.status}" +
+                                if (task.result.isNotBlank()) " — ${task.result.take(300)}" else "",
+                            fontSize = 13.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        if (task.status == VoiceTaskStatus.RUNNING) {
+                            TextButton(onClick = { VoiceTaskHistory.cancel(task.id) }) { Text("Cancel task") }
+                        }
+                    }
+                }
+            }
+            // What the agent sees on screen (v1.2.0).
+            if (screenReading.isNotBlank()) {
+                Spacer(Modifier.height(8.dp))
+                Text("What I see on screen", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                Text(
+                    screenReading.take(1200),
+                    fontSize = 13.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
             Spacer(Modifier.height(8.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 OutlinedTextField(
@@ -743,8 +1051,14 @@ fun LiveScreen(onOpenSettings: () -> Unit = {}) {
                     val text = typeText.trim()
                     if (text.isBlank()) return@IconButton
                     appendTranscript("user", text, true)
-                    liveClient?.sendText(text)
                     typeText = ""
+                    if (!connected) return@IconButton
+                    // Typed action requests take the same path as voice ones.
+                    when {
+                        isReadScreenRequest(text) -> runReadScreen()
+                        isActionRequest(text) -> runVoiceTask(text)
+                        else -> liveClient?.sendText(text)
+                    }
                 }) {
                     Icon(Icons.Filled.Send, contentDescription = "Send")
                 }
@@ -760,6 +1074,22 @@ fun LiveScreen(onOpenSettings: () -> Unit = {}) {
         }
         // Keep context referenced for future intent actions from this tab.
         @Suppress("UNUSED_VARIABLE") val unusedContext = context
+    }
+
+    // Per-step confirmation for voice tasks (v1.2.0): risky steps need an
+    // explicit yes, every time — the dialog completes runVoiceTask's await.
+    pendingLiveStep?.let { step ->
+        AlertDialog(
+            onDismissRequest = { pendingLiveDeferred?.complete(false) },
+            title = { Text("Confirm this step") },
+            text = { Text(step.description) },
+            confirmButton = {
+                TextButton(onClick = { pendingLiveDeferred?.complete(true) }) { Text("Approve") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingLiveDeferred?.complete(false) }) { Text("Skip") }
+            }
+        )
     }
 }
 
@@ -868,6 +1198,30 @@ fun AgentScreen() {
             if (status.isNotBlank()) {
                 Spacer(Modifier.height(8.dp))
                 Text(status, fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+
+        // Voice tasks started from the Live tab (v1.2.0): running / done /
+        // failed, with cancel for running ones.
+        val voiceTasks by VoiceTaskHistory.tasks.collectAsState()
+        if (voiceTasks.isNotEmpty()) {
+            SoftCard {
+                Text("Voice tasks", fontFamily = HeadingFont, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                Spacer(Modifier.height(8.dp))
+                voiceTasks.forEach { task ->
+                    Column(modifier = Modifier.padding(vertical = 6.dp)) {
+                        Text(task.goal, fontSize = 15.sp, fontWeight = FontWeight.Medium)
+                        Text(
+                            "${task.status}" +
+                                if (task.result.isNotBlank()) " — ${task.result.take(300)}" else "",
+                            fontSize = 13.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        if (task.status == VoiceTaskStatus.RUNNING) {
+                            TextButton(onClick = { VoiceTaskHistory.cancel(task.id) }) { Text("Cancel") }
+                        }
+                    }
+                }
             }
         }
 
@@ -1496,6 +1850,9 @@ fun SettingsScreen(onBack: () -> Unit = {}) {
     var groqKey by remember { mutableStateOf(secure.groqApiKey) }
     var notePackage by remember { mutableStateOf(settings.noteAppPackage) }
     var savedNote by remember { mutableStateOf("") }
+    // Display over other apps (v1.2.0): permission state, re-checked on Refresh.
+    var overlayAllowed by remember { mutableStateOf(OverlayState.isOverlayAllowed(context)) }
+    var bubbleEnabled by remember { mutableStateOf(OverlayState.overlayEnabled) }
     val scope = rememberCoroutineScope()
 
     val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
@@ -1713,9 +2070,45 @@ fun SettingsScreen(onBack: () -> Unit = {}) {
         }
 
         SoftCard {
+            Text("Display over other apps", fontFamily = HeadingFont, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "Shows a small floating status bubble while the agent works inside Chrome, Keep, or any other app.",
+                fontSize = 13.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "Status: " + if (overlayAllowed) "Granted" else "Not granted",
+                fontSize = 15.sp
+            )
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                OutlinedButton(onClick = { OverlayState.openOverlaySettings(context) }) { Text("Open system settings") }
+                OutlinedButton(onClick = { overlayAllowed = OverlayState.isOverlayAllowed(context) }) { Text("Refresh") }
+            }
+            Spacer(Modifier.height(8.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Floating bubble", fontSize = 15.sp, modifier = Modifier.weight(1f))
+                Switch(
+                    checked = bubbleEnabled,
+                    onCheckedChange = {
+                        bubbleEnabled = it
+                        OverlayState.overlayEnabled = it
+                    }
+                )
+            }
+            Text(
+                "Optional — the app works the same without it.",
+                fontSize = 13.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+
+        SoftCard {
             Text("About", fontFamily = HeadingFont, fontWeight = FontWeight.Bold, fontSize = 18.sp)
             Spacer(Modifier.height(8.dp))
-            Text("Live Agent 1.1.0", fontSize = 15.sp)
+            Text("Live Agent 1.2.0", fontSize = 15.sp)
             Text(
                 "Sideloaded build. The Play Store is not eligible for this app.",
                 fontSize = 14.sp,
@@ -2288,6 +2681,10 @@ fun ScreenControlScreen(onBack: () -> Unit = {}) {
 
 @Composable
 fun MoreScreen(onNavigate: (String) -> Unit) {
+    val context = LocalContext.current
+    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+    // Last crash (v1.2.0): the real stacktrace from the crash log, if any.
+    var lastCrash by remember { mutableStateOf(CrashLog.read(context)) }
     val rows = listOf(
         Triple("settings", "Settings", Icons.Filled.Settings),
         Triple("terminal", "Terminal", Icons.Filled.Terminal),
@@ -2302,6 +2699,29 @@ fun MoreScreen(onNavigate: (String) -> Unit) {
             .padding(20.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
+        if (lastCrash != null) {
+            item {
+                SoftCard {
+                    Text("Last crash", fontFamily = HeadingFont, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        lastCrash!!.take(900),
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        OutlinedButton(onClick = {
+                            clipboard.setPrimaryClip(ClipData.newPlainText("live-agent-crash", lastCrash ?: ""))
+                        }) { Text("Copy") }
+                        OutlinedButton(onClick = {
+                            CrashLog.clear(context)
+                            lastCrash = null
+                        }) { Text("Clear") }
+                    }
+                }
+            }
+        }
         items(rows) { (id, label, icon) ->
             SoftCard {
                 Row(
