@@ -31,6 +31,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
+import com.nayem.liveagent.data.CrashLog
 import com.nayem.liveagent.ui.AgentScreen
 import com.nayem.liveagent.ui.AuditScreen
 import com.nayem.liveagent.ui.HeadingFont
@@ -48,6 +49,21 @@ import com.nayem.liveagent.ui.TerminalScreen
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Crash log (v1.2.0): write the real stacktrace to a file before the
+        // default handler finishes the process, so the next crash report can
+        // show it in More → Last crash. Never crashes to report a crash, and
+        // the default handler still runs (same kill behaviour as before).
+        val previousHandler = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            try {
+                CrashLog.save(applicationContext, thread, throwable, BuildConfig.VERSION_NAME)
+            } catch (_: Exception) {
+            }
+            try {
+                previousHandler?.uncaughtException(thread, throwable)
+            } catch (_: Exception) {
+            }
+        }
         setContent {
             LiveAgentTheme {
                 MainScreen()
