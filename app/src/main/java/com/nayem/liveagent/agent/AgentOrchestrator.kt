@@ -28,6 +28,8 @@ class AgentOrchestrator(
 ) {
     val phoneTools = PhoneTools(context)
     val terminalTools = TerminalTools(context)
+    /** Layered screen control (v1.2.0): fuzzy node tap, vision, scroll-and-search, verify. */
+    val screenControl = ScreenControl(context, secure.geminiApiKey)
     private val audioManager: AudioManager =
         context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
@@ -45,6 +47,26 @@ class AgentOrchestrator(
     suspend fun buildPlan(goal: String): TaskPlan = withContext(Dispatchers.Default) {
         val g = goal.lowercase()
         val timerMinutes = Regex("(\\d+)\\s*(min|minute)").find(g)?.groupValues?.get(1)?.toIntOrNull()
+        // Composite research → note flow, checked FIRST: "open Chrome, research
+        // AI, note the key points, send it to me / use Google Keep". The speak
+        // step is real search-grounded research (GeminiRestClient.generateText
+        // uses the googleSearch tool); its answer is chained into the Keep
+        // share and the file copy via the "{{prev}}" placeholder in executePlan.
+        val wantsResearch = g.contains("research") || g.contains("search") || g.contains("chrome")
+        val wantsNote = g.contains("note") || g.contains("keep") || g.contains("notepad") || g.contains("write")
+        if (wantsResearch && wantsNote) {
+            val topic = extractResearchTopic(goal)
+            return@withContext TaskPlan(goal, listOf(
+                PlanStep("Research \"$topic\" with search grounding", "speak",
+                    mapOf("prompt" to "Research $topic and list the key points as short bullet lines")),
+                PlanStep("Open Chrome with \"$topic\" search", "intent_chrome",
+                    mapOf("query" to topic)),
+                PlanStep("Save the key points to Google Keep", "share_keep",
+                    mapOf("title" to "AI research notes", "text" to "{{prev}}")),
+                PlanStep("Save a file copy of the notes", "file_note",
+                    mapOf("title" to "note", "text" to "{{prev}}"))
+            ))
+        }
         when {
             g.contains("youtube") && (g.contains("stop") || timerMinutes != null) -> {
                 val query = goal.substringAfter("play", goal).substringBefore(" and stop", goal)
@@ -107,6 +129,39 @@ class AgentOrchestrator(
         }
     }
 
+    /**
+     * Topic for the composite research → note plan: the text after
+     * "research"/"search", cut at the first of "in Chrome" / "and note" /
+     * "note" / "keep" / "notepad" / "write" / "send it". Falls back to the
+     * whole goal when nothing usable remains.
+     * e.g. "open Chrome, research AI, note the key points, send it to me" -> "AI".
+     */
+    private fun extractResearchTopic(goal: String): String {
+        val lower = goal.lowercase()
+        val start = listOf("research", "search")
+            .mapNotNull { word ->
+                lower.indexOf(word).takeIf { it >= 0 }?.plus(word.length)
+            }.minOrNull() ?: 0
+        var topic = if (start > 0) goal.substring(start) else goal
+        val cutMarkers = listOf(
+            "in chrome", "and note", "note", "keep", "notepad", "write",
+            "send it to me", "send it", "to me", "for me"
+        )
+        var earliest = topic.length
+        for (marker in cutMarkers) {
+            val idx = topic.lowercase().indexOf(marker)
+            if (idx >= 0 && idx < earliest) earliest = idx
+        }
+        topic = topic.substring(0, earliest)
+            .trim()
+            .trim(',', '.', ':', ';')
+            .trim()
+            .removePrefix("for ").removePrefix("about ").removePrefix("on ")
+            .removeSuffix(" and").removeSuffix(" for")
+            .trim()
+        return topic.ifBlank { goal.trim() }
+    }
+
     /** Planner-model fallback: ask Gemini to split the goal into short steps.
      *  Memory is read first so remembered preferences shape the plan. */
     private suspend fun plannerPlan(goal: String): TaskPlan {
@@ -150,6 +205,15 @@ class AgentOrchestrator(
         confirm: suspend (PlanStep) -> Boolean = { true }
     ): List<Pair<PlanStep, ToolResult>> = withContext(Dispatchers.IO) {
         val results = mutableListOf<Pair<PlanStep, ToolResult>>()
+        // Step-result chaining for "{{prev}}": the detail of the last
+        // successful step. "{{prev}}" prefers the last successful "speak"
+        // (research) result, so an intervening step such as opening Chrome
+        // does not clobber the research text the next step needs to save;
+        // it falls back to the last successful step's detail otherwise.
+        var lastSuccessDetail = ""
+        var lastSpeakDetail = ""
+        // The API key may have been entered after this orchestrator was built.
+        screenControl.apiKey = secure.geminiApiKey
         plan.steps.take(12).forEachIndexed { index, step ->
             onStep(index, step.description)
             if (step.risky || plan.needsConfirmation) {
@@ -160,11 +224,28 @@ class AgentOrchestrator(
                     return@forEachIndexed
                 }
             }
-            val result = runStep(step)
-            // One retry with the vision fallback for a failed accessibility tap.
-            val final = if (!result.success && step.tool == "a11y_tap") runStepWithVision(step) else result
+            val needsPrev = step.args.values.any { it.contains("{{prev}}") }
+            val prevText = lastSpeakDetail.ifBlank { lastSuccessDetail }
+            val final: ToolResult
+            if (needsPrev && prevText.isBlank()) {
+                final = ToolResult(
+                    false,
+                    "No research result to save yet — the earlier step produced nothing to pass on"
+                )
+            } else {
+                val effectiveStep = if (needsPrev) {
+                    step.copy(args = step.args.mapValues { (_, v) -> v.replace("{{prev}}", prevText) })
+                } else step
+                val result = runStep(effectiveStep)
+                // One retry with the vision fallback for a failed accessibility tap.
+                final = if (!result.success && effectiveStep.tool == "a11y_tap") runStepWithVision(effectiveStep) else result
+            }
             results += step to final
             log("agent", step.description, if (final.success) "OK" else "FAILED", final.detail)
+            if (final.success) {
+                lastSuccessDetail = final.detail
+                if (step.tool == "speak") lastSpeakDetail = final.detail
+            }
             if (!final.success && step.tool !in listOf("verify_media", "speak")) {
                 // Stop after two consecutive failures to avoid blind tapping.
                 if (results.size >= 2 && !results[results.size - 2].second.success) return@withContext results
@@ -182,39 +263,47 @@ class AgentOrchestrator(
                 phoneTools.openChrome("https://www.google.com/search?q=" + java.net.URLEncoder.encode(q, "UTF-8"))
             }
             "intent_note" -> phoneTools.openNoteApp(stores.loadSettings().noteAppPackage, "Note", args["text"] ?: "")
+            "intent_keep" -> phoneTools.openKeep()
+            "share_keep" -> phoneTools.shareToKeep(args["title"] ?: "Note", args["text"] ?: "")
             "intent_app" -> phoneTools.openAppByName(args["name"] ?: args["text"] ?: "")
-            "a11y_tap" -> {
-                phoneTools.screenTapText(args["text"] ?: args["query"] ?: "")
+            "a11y_tap", "screen_tap" -> {
+                // Layered loop (v1.2.0): fuzzy node tap → vision → scroll-and-search,
+                // verified after every action. The attempt log IS the detail.
+                screenControl.apiKey = secure.geminiApiKey
+                val attempt = screenControl.tapTarget(args["text"] ?: args["query"] ?: "")
+                ToolResult(attempt.success, attempt.formatLog())
             }
-            "screen_tap" -> phoneTools.screenTapText(args["text"] ?: args["query"] ?: "")
             "screen_tap_at" -> {
                 val x = args["x"]?.toFloatOrNull() ?: 0f
                 val y = args["y"]?.toFloatOrNull() ?: 0f
-                phoneTools.screenTapAt(x, y)
+                verifyAfter(phoneTools.screenTapAt(x, y))
             }
-            "screen_tap_id" -> phoneTools.screenTapById(args["viewId"] ?: args["text"] ?: "")
-            "screen_longpress" -> phoneTools.screenLongPressText(args["text"] ?: "")
+            "screen_tap_id" -> verifyAfter(phoneTools.screenTapById(args["viewId"] ?: args["text"] ?: ""))
+            "screen_longpress" -> verifyAfter(phoneTools.screenLongPressText(args["text"] ?: ""))
             "screen_swipe" -> {
                 val parts = (args["coords"] ?: "").split(",").mapNotNull { it.trim().toFloatOrNull() }
-                if (parts.size >= 4) phoneTools.screenSwipe(parts[0], parts[1], parts[2], parts[3])
+                if (parts.size >= 4) verifyAfter(phoneTools.screenSwipe(parts[0], parts[1], parts[2], parts[3]))
                 else ToolResult(false, "Swipe needs x1,y1,x2,y2 coordinates")
             }
-            "screen_scroll" -> phoneTools.screenScroll(args["direction"] ?: "down")
-            "screen_press" -> phoneTools.screenPress(args["action"] ?: args["text"] ?: "back")
+            "screen_scroll" -> verifyAfter(phoneTools.screenScroll(args["direction"] ?: "down"))
+            "screen_press" -> verifyAfter(phoneTools.screenPress(args["action"] ?: args["text"] ?: "back"))
             "screen_volume" -> phoneTools.screenVolume(args["direction"] ?: "up")
             "mcp_call" -> runMcpCall(args)
             "terminal_ubuntu" -> ToolResult(
                 false,
-                "Ubuntu environment is not available in Live Agent v1.1.0 — " +
+                "Ubuntu environment is not available in Live Agent v1.2.0 — " +
                     "the Ubuntu install was not delivered. Use Termux (terminal_termux) " +
                     "or the built-in terminal (terminal_builtin) instead."
             )
             "a11y_type" -> {
-                val svc = LiveAccessibilityService.instance
-                    ?: return ToolResult(false, "Accessibility service is not enabled — enable it in Settings")
-                val text = args["text"] ?: ""
-                if (svc.typeText(text)) ToolResult(true, "Typed ${text.length} characters")
-                else ToolResult(false, "No editable field focused on screen")
+                // Layered type: focus the field by hint, set text, verify it
+                // landed, retry once via tap-then-type. Log IS the detail.
+                screenControl.apiKey = secure.geminiApiKey
+                val attempt = screenControl.typeIntoField(
+                    args["text"] ?: "",
+                    args["fieldHint"] ?: args["hint"] ?: ""
+                )
+                ToolResult(attempt.success, attempt.formatLog())
             }
             "file_note" -> {
                 val file = stores.saveNoteCopy(args["title"] ?: "note", args["text"] ?: "")
@@ -271,23 +360,28 @@ class AgentOrchestrator(
         }
     }
 
-    /** Vision fallback: screenshot, ask Gemini where the element is, tap the coordinates. */
-    private suspend fun runStepWithVision(step: PlanStep): ToolResult {
-        return try {
-            val svc = LiveAccessibilityService.instance ?: return ToolResult(false, "Accessibility service is not enabled")
-            val file = phoneTools.takeScreenshotFile() ?: return ToolResult(false, "Could not take a screenshot")
-            if (!secure.hasGeminiKey()) return ToolResult(false, "No API key for the vision fallback")
-            val bytes = file.readBytes()
-            val base64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
-            val target = step.args["text"] ?: step.args["query"] ?: ""
-            val point = GeminiRestClient(secure.geminiApiKey).visionLocate(base64, target) ?: return ToolResult(false, "Vision could not find \"$target\"")
-            val metrics = context.resources.displayMetrics
-            val x = point.first / 1000f * metrics.widthPixels
-            val y = point.second / 1000f * metrics.heightPixels
-            if (svc.tapAt(x, y)) ToolResult(true, "Tapped \"$target\" via vision at ${point.first.toInt()},${point.second.toInt()}")
-            else ToolResult(false, "Vision tap failed for \"$target\"")
-        } catch (e: Exception) {
-            ToolResult(false, "Vision fallback failed: ${e.message}")
+    /**
+     * Verify pass after a raw PhoneTools screen step: re-read the screen and
+     * append what is actually visible now to the step's detail, so a tap at
+     * coordinates or a scroll is never reported on dispatch alone.
+     */
+    private fun verifyAfter(result: ToolResult): ToolResult {
+        val seen = try {
+            screenControl.readScreen().replace("\n", " | ").take(250)
+                .ifBlank { "(screen unreadable)" }
+        } catch (_: Exception) {
+            "(screen unreadable)"
         }
+        return ToolResult(result.success, "${result.detail}\nVerify (re-read screen): $seen")
+    }
+
+    /** Vision fallback: now delegates to the layered ScreenControl loop
+     *  (fuzzy node → vision → scroll-and-search, all verified). Kept as the
+     *  executePlan retry entry point for a failed accessibility tap. */
+    private suspend fun runStepWithVision(step: PlanStep): ToolResult {
+        screenControl.apiKey = secure.geminiApiKey
+        val target = step.args["text"] ?: step.args["query"] ?: ""
+        val attempt = screenControl.tapTarget(target)
+        return ToolResult(attempt.success, attempt.formatLog())
     }
 }
