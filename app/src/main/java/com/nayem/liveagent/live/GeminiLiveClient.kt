@@ -311,7 +311,10 @@ suspend fun testLiveConnection(
     systemPrompt: String
 ): String = withContext(Dispatchers.IO) {
     val done = CompletableDeferred<String>()
-    val client = GeminiLiveClient(apiKey, model, voice, systemPrompt) { event ->
+    // NOTE: the lambda must stay inside the parentheses — onEvent is not the
+    // last constructor parameter (minimalSetup follows it), so the trailing
+    // lambda form does not compile here.
+    val client = GeminiLiveClient(apiKey, model, voice, systemPrompt, { event ->
         when (event) {
             is LiveEvent.SetupComplete -> done.complete("Live connected OK ($model)")
             is LiveEvent.Connected -> { /* SetupComplete already reports success */ }
@@ -319,7 +322,7 @@ suspend fun testLiveConnection(
             is LiveEvent.Disconnected -> done.complete("Live connection closed: ${event.reason}")
             else -> { /* audio/transcripts are irrelevant for the test */ }
         }
-    }
+    })
     try {
         client.connect()
         withTimeoutOrNull(20_000L) { done.await() }
