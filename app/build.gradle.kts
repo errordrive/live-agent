@@ -50,6 +50,9 @@ android {
 
     buildFeatures {
         compose = true
+        // Needed: MainActivity reads BuildConfig.VERSION_NAME for the crash log.
+        // (AGP 8+ does not generate BuildConfig unless this is on.)
+        buildConfig = true
     }
 }
 
