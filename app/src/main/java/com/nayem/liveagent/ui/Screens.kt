@@ -77,7 +77,10 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
@@ -114,6 +117,7 @@ import com.nayem.liveagent.live.GeminiLiveClient
 import com.nayem.liveagent.live.GeminiRestClient
 import com.nayem.liveagent.live.LiveEvent
 import com.nayem.liveagent.live.MicCapture
+import com.nayem.liveagent.live.testLiveConnection
 import com.nayem.liveagent.mcp.McpServerConfig
 import com.nayem.liveagent.mcp.McpStore
 import com.nayem.liveagent.service.LiveAccessibilityService
@@ -122,12 +126,16 @@ import java.util.Date
 import java.util.Locale
 import java.util.UUID
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
 private fun formatTime(ms: Long): String =
     SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(ms))
+
+private fun formatLogTime(ms: Long): String =
+    SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(ms))
 
 private fun formatAuditTime(ms: Long): String =
     SimpleDateFormat("HH:mm dd MMM", Locale.getDefault()).format(Date(ms))
@@ -254,6 +262,32 @@ fun LiveScreen(onOpenSettings: () -> Unit = {}) {
     var agentAmplitude by remember { mutableStateOf(0f) }
     var micPermissionNeeded by remember { mutableStateOf(false) }
 
+    // Connection diagnostics (v1.1.1): live stage + elapsed time + sticky
+    // last error + connection log, so the next "stuck" report is evidence.
+    var stage by remember { mutableStateOf("Idle") }
+    var callActive by remember { mutableStateOf(false) }
+    var startedAt by remember { mutableLongStateOf(0L) }
+    var elapsedSec by remember { mutableIntStateOf(0) }
+    var lastError by remember { mutableStateOf("") }
+    var connLog by remember { mutableStateOf<List<String>>(emptyList()) }
+    var attemptCounter by remember { mutableIntStateOf(0) }
+    var retriedThisCall by remember { mutableStateOf(false) }
+
+    fun logLine(message: String) {
+        val stamped = "${formatLogTime(System.currentTimeMillis())} $message"
+        connLog = (connLog + stamped).takeLast(20)
+    }
+
+    // Elapsed-seconds ticker while a call is active.
+    LaunchedEffect(callActive) {
+        if (callActive) {
+            while (true) {
+                elapsedSec = ((System.currentTimeMillis() - startedAt) / 1000).toInt().coerceAtLeast(0)
+                delay(1000)
+            }
+        }
+    }
+
     var liveClient by remember { mutableStateOf<GeminiLiveClient?>(null) }
     var mic by remember { mutableStateOf<MicCapture?>(null) }
     val player = remember { AudioPlayer() }
@@ -285,7 +319,8 @@ fun LiveScreen(onOpenSettings: () -> Unit = {}) {
         if (isFinal) MemoryAuto.autoSaveTurn(stores, role, text)
     }
 
-    fun stopLive() {
+    /** Tear down mic/player/socket without touching status, stage, last error or log. */
+    fun disconnectCall() {
         try { mic?.stop() } catch (_: Exception) {}
         mic = null
         try { player.stop(); player.clear() } catch (_: Exception) {}
@@ -294,9 +329,19 @@ fun LiveScreen(onOpenSettings: () -> Unit = {}) {
         connected = false
         speaking = false
         thinking = false
+        callActive = false
         micAmplitude = 0f
         agentAmplitude = 0f
+    }
+
+    fun stopLive() {
+        disconnectCall()
+        // Sticky evidence: the last error and the connection log survive a
+        // stop, so the user can still read what went wrong after the call ends.
         status = "Not connected"
+        stage = "Idle"
+        startedAt = 0L
+        elapsedSec = 0
     }
 
     DisposableEffect(Unit) {
@@ -304,45 +349,98 @@ fun LiveScreen(onOpenSettings: () -> Unit = {}) {
     }
 
     fun startLive() {
-        // Never depend on the key-test result: connect directly and surface
-        // the real error if it fails.
-        if (!secure.hasGeminiKey()) {
-            status = "Add your Gemini API key in Settings first."
-            return
+        startCall(settings.model, isRetry = false, minimal = false)
+    }
+
+    /**
+     * One connection attempt. `isRetry` is true only for the single automatic
+     * retry: model gemini-3.8-live-extended-thinking with a MINIMAL setup
+     * (model + responseModalities only), which tells us whether any setup
+     * shape works if the full corrected setup still gets no setupComplete.
+     *
+     * Fix for "stuck on Connecting...": every attempt gets its own id, and
+     * events from an older attempt are ignored — a stale client's error can
+     * no longer kill the live attempt (that race left the UI on
+     * "Connecting..." with a dead socket and no further events). Tapping
+     * Start while connecting now shows Cancel instead of starting a second
+     * attempt.
+     */
+    fun startCall(model: String, isRetry: Boolean, minimal: Boolean) {
+        if (!isRetry) {
+            if (!secure.hasGeminiKey()) {
+                status = "Add your Gemini API key in Settings first."
+                return
+            }
+            if (!hasMicPermission()) {
+                status = "Microphone permission needed."
+                micPermissionNeeded = true
+                micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                return
+            }
+            micPermissionNeeded = false
+            lastError = ""
+            retriedThisCall = false
+            startedAt = System.currentTimeMillis()
+            elapsedSec = 0
+            logLine("Start tapped — model $model")
         }
-        if (!hasMicPermission()) {
-            status = "Microphone permission needed."
-            micPermissionNeeded = true
-            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-            return
-        }
-        micPermissionNeeded = false
+        // Never stack attempts: drop any previous socket before opening a new one.
+        try { liveClient?.reset() } catch (_: Exception) {}
+        liveClient = null
         val key = secure.geminiApiKey
         val personaSuffix = Personas.firstOrNull { it.first == persona }?.second.orEmpty()
         val prompt = if (personaSuffix.isBlank()) settings.systemPrompt
         else settings.systemPrompt + "\nPersona: $personaSuffix"
-        status = "Connecting..."
+        attemptCounter += 1
+        val myAttempt = attemptCounter
+        status = if (isRetry) "Retrying with extended-thinking (minimal setup)..."
+            else "Connecting..."
+        stage = if (isRetry) "Retrying with extended-thinking" else "Opening socket..."
         thinking = true
-        val client = GeminiLiveClient(key, settings.model, voice, prompt) { event ->
+        callActive = true
+        val client = GeminiLiveClient(key, model, voice, prompt, { event ->
             scope.launch {
+            if (myAttempt != attemptCounter) return@launch // stale attempt — ignore
             when (event) {
+                is LiveEvent.SocketOpened -> {
+                    stage = "Socket opened — sending setup..."
+                    logLine("Socket opened")
+                }
+                is LiveEvent.SetupSent -> {
+                    stage = "Waiting for setup..."
+                    logLine("Setup sent ($model${if (minimal) ", minimal" else ""})")
+                }
+                is LiveEvent.RawFrame -> {
+                    logLine("frame: ${event.summary}")
+                }
                 is LiveEvent.Connected -> {
                     connected = true
                     speaking = false
                     thinking = false
+                    stage = "Connected"
                     status = "Connected — listening"
+                    lastError = ""
+                    logLine("Connected ($model)")
                 }
                 is LiveEvent.Disconnected -> {
+                    logLine("Closed: ${event.reason}")
+                    // A disconnect after a reported error must not wipe the error.
                     connected = false
                     speaking = false
                     thinking = false
-                    if (status.startsWith("Connecting") || status.startsWith("Ready")) {
+                    callActive = false
+                    if (lastError.isBlank()) {
+                        stage = "Disconnected"
                         status = "Not connected — ${event.reason}"
+                    } else {
+                        stage = "Failed"
                     }
                 }
                 is LiveEvent.SetupComplete -> {
                     thinking = false
+                    stage = "Connected"
                     status = "Ready — speak now"
+                    logLine("setupComplete received")
                 }
                 is LiveEvent.UserTranscript -> {
                     appendTranscript("user", event.text, event.isFinal)
@@ -364,26 +462,56 @@ fun LiveScreen(onOpenSettings: () -> Unit = {}) {
                     player.stop()
                 }
                 is LiveEvent.Error -> {
-                    // Surface the real server/WebSocket error, not a generic line.
+                    // Surface the real error and keep it sticky — never wiped
+                    // by the teardown below or by stopLive().
+                    lastError = event.message
+                    stage = "Failed"
                     status = event.message
                     thinking = false
-                    stopLive()
-                    status = event.message
+                    logLine("Error: ${event.message}")
+                    // One automatic retry with the extended-thinking model and
+                    // a minimal setup if the first setup failed or timed out.
+                    if (!isRetry && !retriedThisCall && !connected) {
+                        retriedThisCall = true
+                        logLine("Retrying with gemini-3.8-live-extended-thinking + minimal setup...")
+                        disconnectCall()
+                        status = "Retrying with extended-thinking (minimal setup)..."
+                        stage = "Retrying with extended-thinking"
+                        startCall(
+                            "gemini-3.8-live-extended-thinking",
+                            isRetry = true,
+                            minimal = true
+                        )
+                    } else {
+                        disconnectCall()
+                        status = event.message
+                        stage = "Failed"
+                    }
                 }
             }
             }
-        }
+        }, minimalSetup = minimal)
         liveClient = client
         try {
             client.connect()
-            val capture = MicCapture(context) { pcm -> client.sendAudioPcm16(pcm) }
-            capture.onAmplitude = { micAmplitude = it }
-            mic = capture
-            capture.start()
+            if (mic == null) {
+                // The capture callback reads the CURRENT liveClient, so a
+                // retry swaps the socket without restarting the mic.
+                val capture = MicCapture(context) { pcm ->
+                    liveClient?.sendAudioPcm16(pcm)
+                }
+                capture.onAmplitude = { micAmplitude = it }
+                mic = capture
+                capture.start()
+            }
         } catch (e: Exception) {
-            status = "Could not start: ${e.message}"
-            stopLive()
-            status = "Could not start: ${e.message}"
+            lastError = "Could not start: ${e.message}"
+            status = lastError
+            stage = "Failed"
+            logLine("Error: $lastError")
+            disconnectCall()
+            status = lastError
+            stage = "Failed"
         }
     }
 
@@ -496,27 +624,73 @@ fun LiveScreen(onOpenSettings: () -> Unit = {}) {
                     )
                 }
                 Spacer(Modifier.height(12.dp))
+                // While connecting the button is Cancel, not a second Start:
+                // a second tap used to spawn a duplicate client whose error
+                // handler killed the live attempt and left "Connecting..."
+                // stuck on a dead socket.
+                val connecting = callActive && !connected
                 Button(
-                    onClick = { if (connected) stopLive() else startLive() },
+                    onClick = {
+                        when {
+                            connected -> stopLive()
+                            connecting -> stopLive()
+                            else -> startLive()
+                        }
+                    },
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB08D57)),
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(56.dp)
                 ) {
                     Icon(
-                        if (connected) Icons.Filled.Stop else Icons.Filled.PlayArrow,
+                        if (connected || connecting) Icons.Filled.Stop else Icons.Filled.PlayArrow,
                         contentDescription = null
                     )
                     Spacer(Modifier.width(8.dp))
-                    Text(if (connected) "Stop call" else "Start call", fontSize = 17.sp)
+                    Text(
+                        when {
+                            connected -> "Stop call"
+                            connecting -> "Cancel"
+                            else -> "Start call"
+                        },
+                        fontSize = 17.sp
+                    )
                 }
                 Spacer(Modifier.height(8.dp))
                 Text(status, fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "Stage: $stage" + if (callActive) " · ${elapsedSec}s" else "",
+                    fontSize = 13.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
                 if (micPermissionNeeded) {
                     Spacer(Modifier.height(8.dp))
                     OutlinedButton(onClick = {
                         micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
                     }) { Text("Allow microphone") }
+                }
+            }
+        }
+
+        SoftCard {
+            Text("Connection", fontFamily = HeadingFont, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "Stage: $stage" + if (callActive) " · ${elapsedSec}s since Start" else "",
+                fontSize = 14.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            if (lastError.isNotBlank()) {
+                Spacer(Modifier.height(8.dp))
+                Text("Last error: $lastError", fontSize = 14.sp, color = Color(0xFFB3261E))
+            }
+            if (connLog.isNotEmpty()) {
+                Spacer(Modifier.height(8.dp))
+                Text("Log", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                Spacer(Modifier.height(4.dp))
+                connLog.forEach { line ->
+                    Text(line, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
         }
@@ -1314,6 +1488,8 @@ fun SettingsScreen(onBack: () -> Unit = {}) {
     var geminiKey by remember { mutableStateOf(secure.geminiApiKey) }
     var showGeminiKey by remember { mutableStateOf(false) }
     var geminiKeyStatus by remember { mutableStateOf("") }
+    var liveTestStatus by remember { mutableStateOf("") }
+    var liveTestRunning by remember { mutableStateOf(false) }
     var openRouterKey by remember { mutableStateOf(secure.openRouterApiKey) }
     var groqKey by remember { mutableStateOf(secure.groqApiKey) }
     var notePackage by remember { mutableStateOf(settings.noteAppPackage) }
@@ -1420,6 +1596,32 @@ fun SettingsScreen(onBack: () -> Unit = {}) {
             if (geminiKeyStatus.isNotBlank()) {
                 Spacer(Modifier.height(8.dp))
                 Text(geminiKeyStatus, fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Spacer(Modifier.height(12.dp))
+            OutlinedButton(
+                onClick = {
+                    val key = geminiKey.trim()
+                    if (key.isBlank()) {
+                        liveTestStatus = "Enter a key first."
+                        return@OutlinedButton
+                    }
+                    liveTestRunning = true
+                    liveTestStatus = "Testing — opening socket..."
+                    scope.launch {
+                        liveTestStatus = testLiveConnection(
+                            apiKey = key,
+                            model = settings.model,
+                            voice = settings.voiceName.ifBlank { "Kore" },
+                            systemPrompt = settings.systemPrompt
+                        )
+                        liveTestRunning = false
+                    }
+                },
+                enabled = !liveTestRunning
+            ) { Text(if (liveTestRunning) "Testing..." else "Test live connection") }
+            if (liveTestStatus.isNotBlank()) {
+                Spacer(Modifier.height(8.dp))
+                Text(liveTestStatus, fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
 
