@@ -138,6 +138,53 @@ class PhoneTools(private val context: Context) {
         }
     }
 
+    /**
+     * Share text into Google Keep (com.google.android.keep) via ACTION_SEND.
+     *
+     * Keep has no public write API, so this share intent is the honest path:
+     * it opens Keep's new-note editor with the title/text already filled in.
+     * The user still sees the editor and can edit before the note saves —
+     * nothing is written silently behind their back. Never crashes when
+     * Keep is missing; that is a plain failed ToolResult.
+     */
+    fun shareToKeep(title: String, text: String): ToolResult {
+        if (!isPackageInstalled("com.google.android.keep")) {
+            return ToolResult(false, "Google Keep is not installed")
+        }
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_TEXT, text)
+            putExtra(Intent.EXTRA_TITLE, title)
+            putExtra(Intent.EXTRA_SUBJECT, title)
+            setPackage("com.google.android.keep")
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        return try {
+            context.startActivity(intent)
+            ToolResult(true, "Shared to Google Keep: \"$title\" (${text.length} chars)")
+        } catch (e: Exception) {
+            ToolResult(false, "Failed to share to Google Keep: ${e.message}")
+        }
+    }
+
+    /** Open Google Keep directly (package first, launcher label as fallback). */
+    fun openKeep(): ToolResult {
+        if (isPackageInstalled("com.google.android.keep")) {
+            val launchIntent = context.packageManager
+                .getLaunchIntentForPackage("com.google.android.keep")
+                ?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            if (launchIntent != null) {
+                return try {
+                    context.startActivity(launchIntent)
+                    ToolResult(true, "Opened Google Keep (com.google.android.keep)")
+                } catch (e: Exception) {
+                    ToolResult(false, "Failed to open Google Keep: ${e.message}")
+                }
+            }
+        }
+        return openAppByName("Keep Notes")
+    }
+
     fun makeCall(number: String): ToolResult {
         if (context.checkSelfPermission(Manifest.permission.CALL_PHONE)
             != PackageManager.PERMISSION_GRANTED
